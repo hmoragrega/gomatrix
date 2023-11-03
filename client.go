@@ -5,6 +5,7 @@ package gomatrix
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,6 +28,7 @@ type Client struct {
 	Client        *http.Client // The underlying HTTP client which will be used to make HTTP requests.
 	Syncer        Syncer       // The thing which can process /sync responses
 	Store         Storer       // The thing which can store rooms/tokens/ids
+	SyncTimeout   int          // The number of milliseconds to wait for /sync requests to complete. Defaults to 30000 (30 seconds).
 
 	// The ?user_id= query parameter for application services. This must be set *prior* to calling a method. If this is empty,
 	// no user_id parameter will be sent.
@@ -102,7 +104,11 @@ func (cli *Client) ClearCredentials() {
 	cli.UserID = ""
 }
 
-// Sync starts syncing with the provided Homeserver. If Sync() is called twice then the first sync will be stopped and the
+func (cli *Client) Sync() error {
+	return cli.SyncCtx(context.Background())
+}
+
+// SyncCtx starts syncing with the provided Homeserver. If Sync() is called twice then the first sync will be stopped and the
 // error will be nil.
 //
 // This function will block until a fatal /sync error occurs, so it should almost always be started as a new goroutine.
@@ -110,8 +116,9 @@ func (cli *Client) ClearCredentials() {
 //   - The failure to create a filter.
 //   - Client.Syncer.OnFailedSync returning an error in response to a failed sync.
 //   - Client.Syncer.ProcessResponse returning an error.
+//
 // If you wish to continue retrying in spite of these fatal errors, call Sync() again.
-func (cli *Client) Sync() error {
+func (cli *Client) SyncCtx(ctx context.Context) error {
 	// Mark the client as syncing.
 	// We will keep syncing until the syncing state changes. Either because
 	// Sync is called or StopSync is called.
@@ -128,8 +135,12 @@ func (cli *Client) Sync() error {
 		cli.Store.SaveFilterID(cli.UserID, filterID)
 	}
 
+	timeout := cli.SyncTimeout
+	if timeout == 0 {
+		timeout = 30000
+	}
 	for {
-		resSync, err := cli.SyncRequest(30000, nextBatch, filterID, false, "")
+		resSync, err := cli.SyncRequest(ctx, cli.SyncTimeout, nextBatch, filterID, false, "")
 		if err != nil {
 			duration, err2 := cli.Syncer.OnFailedSync(resSync, err)
 			if err2 != nil {
@@ -177,14 +188,18 @@ func (cli *Client) StopSync() {
 	cli.incrementSyncingID()
 }
 
-// MakeRequest makes a JSON HTTP request to the given URL.
+func (cli *Client) MakeRequest(method string, httpURL string, reqBody interface{}, resBody interface{}) error {
+	return cli.MakeRequestCtx(context.Background(), method, httpURL, reqBody, resBody)
+}
+
+// MakeRequestCtx makes a JSON HTTP request to the given URL.
 // The response body will be stream decoded into an interface. This will automatically stop if the response
 // body is nil.
 //
 // Returns an error if the response is not 2xx along with the HTTP body bytes if it got that far. This error is
 // an HTTPError which includes the returned HTTP status code, byte contents of the response body and possibly a
 // RespError as the WrappedError, if the HTTP body could be decoded as a RespError.
-func (cli *Client) MakeRequest(method string, httpURL string, reqBody interface{}, resBody interface{}) error {
+func (cli *Client) MakeRequestCtx(ctx context.Context, method string, httpURL string, reqBody interface{}, resBody interface{}) error {
 	var req *http.Request
 	var err error
 	if reqBody != nil {
@@ -192,9 +207,9 @@ func (cli *Client) MakeRequest(method string, httpURL string, reqBody interface{
 		if err := json.NewEncoder(buf).Encode(reqBody); err != nil {
 			return err
 		}
-		req, err = http.NewRequest(method, httpURL, buf)
+		req, err = http.NewRequestWithContext(ctx, method, httpURL, buf)
 	} else {
-		req, err = http.NewRequest(method, httpURL, nil)
+		req, err = http.NewRequestWithContext(ctx, method, httpURL, nil)
 	}
 
 	if err != nil {
@@ -257,6 +272,11 @@ func (cli *Client) CreateFilter(filter json.RawMessage) (resp *RespCreateFilter,
 
 // SyncRequest makes an HTTP request according to http://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-client-r0-sync
 func (cli *Client) SyncRequest(timeout int, since, filterID string, fullState bool, setPresence string) (resp *RespSync, err error) {
+	return cli.SyncRequestCtx(context.Background(), timeout, since, filterID, fullState, setPresence)
+}
+
+// SyncRequestCtx makes an HTTP request according to http://matrix.org/docs/spec/client_server/r0.2.0.html#get-matrix-client-r0-sync
+func (cli *Client) SyncRequestCtx(ctx context.Context, timeout int, since, filterID string, fullState bool, setPresence string) (resp *RespSync, err error) {
 	query := map[string]string{
 		"timeout": strconv.Itoa(timeout),
 	}
@@ -320,14 +340,14 @@ func (cli *Client) RegisterGuest(req *ReqRegister) (*RespRegister, *RespUserInte
 //
 // This does not set credentials on the client instance. See SetCredentials() instead.
 //
-// 	res, err := cli.RegisterDummy(&gomatrix.ReqRegister{
-//		Username: "alice",
-//		Password: "wonderland",
-//	})
-//  if err != nil {
-// 		panic(err)
-// 	}
-// 	token := res.AccessToken
+//		res, err := cli.RegisterDummy(&gomatrix.ReqRegister{
+//			Username: "alice",
+//			Password: "wonderland",
+//		})
+//	 if err != nil {
+//			panic(err)
+//		}
+//		token := res.AccessToken
 func (cli *Client) RegisterDummy(req *ReqRegister) (*RespRegister, error) {
 	res, uia, err := cli.Register(req)
 	if err != nil && uia == nil {
@@ -595,10 +615,11 @@ func (cli *Client) MarkRead(roomID, eventID string) error {
 }
 
 // CreateRoom creates a new Matrix room. See https://matrix.org/docs/spec/client_server/r0.2.0.html#post-matrix-client-r0-createroom
-//  resp, err := cli.CreateRoom(&gomatrix.ReqCreateRoom{
-//  	Preset: "public_chat",
-//  })
-//  fmt.Println("Room:", resp.RoomID)
+//
+//	resp, err := cli.CreateRoom(&gomatrix.ReqCreateRoom{
+//		Preset: "public_chat",
+//	})
+//	fmt.Println("Room:", resp.RoomID)
 func (cli *Client) CreateRoom(req *ReqCreateRoom) (resp *RespCreateRoom, err error) {
 	urlPath := cli.BuildURL("createRoom")
 	err = cli.MakeRequest("POST", urlPath, req, &resp)
