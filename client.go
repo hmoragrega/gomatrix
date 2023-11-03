@@ -140,7 +140,7 @@ func (cli *Client) SyncCtx(ctx context.Context) error {
 		timeout = 30000
 	}
 	for {
-		resSync, err := cli.SyncRequest(ctx, cli.SyncTimeout, nextBatch, filterID, false, "")
+		resSync, err := cli.SyncRequestCtx(ctx, cli.SyncTimeout, nextBatch, filterID, false, "")
 		if err != nil {
 			duration, err2 := cli.Syncer.OnFailedSync(resSync, err)
 			if err2 != nil {
