@@ -293,7 +293,7 @@ func (cli *Client) SyncRequestCtx(ctx context.Context, timeout int, since, filte
 		query["full_state"] = "true"
 	}
 	urlPath := cli.BuildURLWithQuery([]string{"sync"}, query)
-	err = cli.MakeRequest("GET", urlPath, nil, &resp)
+	err = cli.MakeRequestCtx(ctx, "GET", urlPath, nil, &resp)
 	return
 }
 
